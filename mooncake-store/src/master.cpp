@@ -85,6 +85,9 @@ DEFINE_string(memory_allocator, "offset",
 DEFINE_string(
     allocation_strategy, "random",
     "Allocation strategy for segments, random | free_ratio_first | cxl");
+DEFINE_string(eviction_policy, "original",
+              "Eviction victim-selection policy, original | size_aware | "
+              "attention_aware | score_based | layer_aware | sieve");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -205,6 +208,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("allocation_strategy",
                              &master_config.allocation_strategy,
                              FLAGS_allocation_strategy);
+    default_config.GetString("eviction_policy", &master_config.eviction_policy,
+                             FLAGS_eviction_policy);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -427,6 +432,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.allocation_strategy = FLAGS_allocation_strategy;
     }
+    if ((google::GetCommandLineFlagInfo("eviction_policy", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.eviction_policy = FLAGS_eviction_policy;
+    }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -605,6 +615,12 @@ int main(int argc, char* argv[]) {
                    << ", must be 'cachelib' or 'offset'";
         return 1;
     }
+    try {
+        (void)mooncake::ParseEvictionPolicyType(master_config.eviction_policy);
+    } catch (const std::exception& e) {
+        LOG(FATAL) << e.what();
+        return 1;
+    }
 
     const char* value = std::getenv("MC_RPC_PROTOCOL");
     std::string protocol = "tcp";
@@ -639,6 +655,7 @@ int main(int argc, char* argv[]) {
         << ", global_file_segment_size="
         << master_config.global_file_segment_size
         << ", memory_allocator=" << master_config.memory_allocator
+        << ", eviction_policy=" << master_config.eviction_policy
         << ", enable_http_metadata_server="
         << master_config.enable_http_metadata_server
         << ", http_metadata_server_port="

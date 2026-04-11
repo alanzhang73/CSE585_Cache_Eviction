@@ -6,6 +6,7 @@
 #include <glog/logging.h>
 
 #include "config_helper.h"
+#include "eviction_policy.h"
 #include "types.h"
 
 namespace mooncake {
@@ -36,6 +37,7 @@ struct MasterConfig {
     int64_t global_file_segment_size;
     std::string memory_allocator;
     std::string allocation_strategy;
+    std::string eviction_policy = "original";
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -100,6 +102,7 @@ class MasterServiceSupervisorConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    EvictionPolicyType eviction_policy_type = EvictionPolicyType::ORIGINAL;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -159,6 +162,14 @@ class MasterServiceSupervisorConfig {
             memory_allocator = BufferAllocatorType::CACHELIB;
         } else {
             memory_allocator = BufferAllocatorType::OFFSET;
+        }
+
+        try {
+            eviction_policy_type =
+                ParseEvictionPolicyType(config.eviction_policy);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << e.what() << ". Defaulting to 'original'.";
+            eviction_policy_type = EvictionPolicyType::ORIGINAL;
         }
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -250,6 +261,7 @@ class WrappedMasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    EvictionPolicyType eviction_policy_type = EvictionPolicyType::ORIGINAL;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -324,6 +336,17 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
+        try {
+            eviction_policy_type =
+                ParseEvictionPolicyType(config.eviction_policy);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << e.what()
+                         << ". Defaulting to 'original'. Valid options are: "
+                            "original, size_aware, attention_aware, "
+                            "score_based, layer_aware, sieve";
+            eviction_policy_type = EvictionPolicyType::ORIGINAL;
+        }
+
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
@@ -369,6 +392,7 @@ class WrappedMasterServiceConfig {
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        eviction_policy_type = config.eviction_policy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -417,6 +441,7 @@ class MasterServiceConfigBuilder {
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type_ =
         AllocationStrategyType::RANDOM;
+    EvictionPolicyType eviction_policy_type_ = EvictionPolicyType::ORIGINAL;
     bool enable_disk_eviction_ = true;
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
@@ -515,6 +540,12 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allocation_strategy_type(
         AllocationStrategyType type) {
         allocation_strategy_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_eviction_policy_type(
+        EvictionPolicyType type) {
+        eviction_policy_type_ = type;
         return *this;
     }
 
@@ -649,6 +680,7 @@ class MasterServiceConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     AllocationStrategyType allocation_strategy_type =
         AllocationStrategyType::RANDOM;
+    EvictionPolicyType eviction_policy_type = EvictionPolicyType::ORIGINAL;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -696,6 +728,7 @@ class MasterServiceConfig {
         memory_allocator =
             config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         allocation_strategy_type = config.allocation_strategy_type;
+        eviction_policy_type = config.eviction_policy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -746,6 +779,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
     config.allocation_strategy_type = allocation_strategy_type_;
+    config.eviction_policy_type = eviction_policy_type_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;

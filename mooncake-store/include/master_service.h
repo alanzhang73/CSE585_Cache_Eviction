@@ -19,20 +19,20 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
+#include "eviction_policy.h"
+#include "master_config.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "segment.h"
-#include "types.h"
-#include "master_config.h"
-#include "rpc_types.h"
 #include "replica.h"
+#include "rpc_types.h"
+#include "segment.h"
 #include "serialize/serializer_backend.h"
 #include "task_manager.h"
+#include "types.h"
 
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
-class EvictionStrategy;
 
 // Forward declarations for test classes
 namespace test {
@@ -438,14 +438,8 @@ class MasterService {
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
 
-    // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
-    // object with smaller lease timeout. It has two passes. The first pass only
-    // evicts objects without soft pin. The second pass prioritizes objects
-    // without soft pin, but also allows to evict soft pinned objects if
-    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
-    // evict ratio target. If the actual evicted ratio is less than
-    // evict_ratio_lowerbound, the second pass will be triggered and try to
-    // fulfill evict ratio lowerbound.
+    // BatchEvict keeps orchestration inside MasterService. The policy object
+    // only ranks already-eligible eviction candidates.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
     // Clear invalid handles in all shards
@@ -802,6 +796,8 @@ class MasterService {
         false};  // Set to trigger eviction when not enough space left
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const EvictionPolicyType eviction_policy_type_;
+    std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     // Eviction thread related members
     std::thread eviction_thread_;

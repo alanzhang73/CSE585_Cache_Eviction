@@ -1,0 +1,99 @@
+You are helping me refactor Mooncake’s eviction logic so I can experiment with multiple eviction policies cleanly.
+
+Important architectural context:
+- Mooncake’s current eviction flow is centered around `MasterService`.
+- `PutStart(...)` may set `need_eviction_ = true` when allocation fails.
+- `EvictionThreadFunc()` decides when eviction should run, based on memory pressure and `need_eviction_`.
+- `BatchEvict(...)` is where eviction candidates are gathered and victims are chosen.
+- I do NOT want to move all eviction logic out of `MasterService`.
+- I DO want to extract the **victim selection policy** into a separate file/module.
+- So the refactor should keep `MasterService` responsible for:
+  - deciding when to evict
+  - walking metadata shards
+  - checking legality/safety of eviction
+  - actually deleting replicas / metadata
+  - updating counters and metrics
+- The separate file should only decide:
+  - given a list of already-eligible candidates, which keys should be evicted
+
+This means:
+- I should still be building on top of `MasterService`
+- but I want the policy implementation itself to live in a separate file because that is much cleaner than editing a multi-thousand-line file for every policy experiment
+
+My goals:
+1. Refactor thoughtfully and conservatively.
+2. Preserve correctness and existing safety constraints.
+3. Keep the current behavior available as a baseline policy.
+4. Add a second size-aware policy for experiments.
+5. Make it easy to add future policies like FIFO or random.
+6. Keep the design simple and idiomatic C++.
+
+Important constraints:
+- Do not move shard traversal out of `MasterService`
+- Do not move lock ownership / metadata ownership out of `MasterService`
+- Do not move replica erasure out of `MasterService`
+- Do not bypass existing checks for:
+  - lease expiration
+  - completed replicas only
+  - refcount / active-use protection
+  - soft-pin handling
+- The new policy abstraction should only operate on a vector/list of already-eligible eviction candidates and return selected victim keys
+- Prefer minimal, incremental changes over a full rewrite
+
+Please assume the current code structure is roughly:
+- `PutStart(...)` triggers pressure (`need_eviction_ = true`)
+- `EvictionThreadFunc()` decides when to call `BatchEvict(...)`
+- `BatchEvict(...)` currently contains hard-coded victim selection logic
+- `MasterService` is the right place to keep orchestration
+- a separate file is the right place to hold pluggable victim-selection logic
+
+What I want from you:
+1. First explain the clean abstraction boundary for this refactor
+2. Propose a minimal interface for a new eviction-policy module
+3. Suggest what files/classes/structs to create
+4. Show `eviction_policy.h`
+5. Show `eviction_policy.cpp`
+6. Implement the following additional policies:
+   A. Attention-Aware Eviction
+The Core Concept: LRU assumes the oldest tokens are the least useful, which fails in long-context LLM tasks where early tokens (like system prompts or key instructions) remain critical.
+The Mechanism: Inspired by Attention-Gate, this policy calculates an "attention score" (or saliency) for each token, representing its actual contribution to the model's output during decoding.
+Mooncake Integration: You will average these token-level attention scores across an entire KV cache block. By combining this average score with general relevancy, you create a priority metric to evict the blocks that the model is mathematically ignoring.
+
+B. Score-Based Eviction (NACL approach)
+The Core Concept: Instead of just looking backward at past attention, this policy tries to predict future utility.
+The Mechanism: It uses "proxy tokens" to test and score how strongly different KV entries interact with representative tokens. This interaction strength acts as an estimated utility score.
+Mooncake Integration: You will track these importance scores at the token level and aggregate them into a block-level priority score within Mooncake's KV management layer. When storage gets tight, blocks with the lowest estimated future utility are evicted.
+
+C. Layer-Aware Eviction (CAKE approach)
+The Core Concept: Not all transformer layers are created equal. Some layers process highly concentrated, critical information, while others are less impactful.
+The Mechanism: Using attention density and temporal locality, this policy dynamically budgets cache capacity per layer. High-value layers are allocated more cache space, while low-value layers are subjected to heavy token eviction.
+Mooncake Integration: Applying this to Mooncake means adapting the KV-cache management pipeline to be layer-aware. Specifically for prefill nodes, this acts as a filter: they will only retain and transmit the high-value KV segments from important layers, heavily optimizing network bandwidth and memory usage during transfer.
+
+D. SIEVE Eviction (Ultra-Fast, Low-Overhead Baseline)
+
+7. Show the minimal changes needed inside `MasterService::BatchEvict(...)`
+8. Call out invariants and likely pitfalls
+9. Keep code realistic and directly usable
+
+Design preferences:
+- Simple OOP is fine
+- Avoid fancy templates or overengineering
+- Explicit code is preferred
+- Small interface surface is preferred
+- Candidate struct can include fields like:
+  - key
+  - lease_timeout
+  - size
+  - maybe soft_pinned if useful
+- The policy should probably return something like a set of selected keys
+
+Coding goal:
+I want to be able to swap policies without rewriting `BatchEvict(...)` every time.
+
+Please proceed in this order:
+1. summarize the current architecture and why `MasterService` should stay involved
+2. define the policy boundary
+3. propose the new files and interfaces
+4. implement the 4 additional and keep the original batch eviction policy as it's own function in the new file
+6. show the `BatchEvict(...)` integration changes
+7. list risks / testing checks
