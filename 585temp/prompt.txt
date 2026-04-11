@@ -1,99 +1,79 @@
-You are helping me refactor Mooncake’s eviction logic so I can experiment with multiple eviction policies cleanly.
+I added a new eviction policy abstraction to Mooncake, and the internal runtime plumbing seems to exist, but the `mooncake_master` CLI still does not recognize my new flag:
 
-Important architectural context:
-- Mooncake’s current eviction flow is centered around `MasterService`.
-- `PutStart(...)` may set `need_eviction_ = true` when allocation fails.
-- `EvictionThreadFunc()` decides when eviction should run, based on memory pressure and `need_eviction_`.
-- `BatchEvict(...)` is where eviction candidates are gathered and victims are chosen.
-- I do NOT want to move all eviction logic out of `MasterService`.
-- I DO want to extract the **victim selection policy** into a separate file/module.
-- So the refactor should keep `MasterService` responsible for:
-  - deciding when to evict
-  - walking metadata shards
-  - checking legality/safety of eviction
-  - actually deleting replicas / metadata
-  - updating counters and metrics
-- The separate file should only decide:
-  - given a list of already-eligible candidates, which keys should be evicted
+    --eviction_policy=attention_aware
 
-This means:
-- I should still be building on top of `MasterService`
-- but I want the policy implementation itself to live in a separate file because that is much cleaner than editing a multi-thousand-line file for every policy experiment
+I need you to fix this end-to-end.
 
-My goals:
-1. Refactor thoughtfully and conservatively.
-2. Preserve correctness and existing safety constraints.
-3. Keep the current behavior available as a baseline policy.
-4. Add a second size-aware policy for experiments.
-5. Make it easy to add future policies like FIFO or random.
-6. Keep the design simple and idiomatic C++.
+What already exists:
+- `EvictionPolicyType` exists in `eviction_policy.h`
+- `ParseEvictionPolicyType(...)` exists in `eviction_policy.cpp`
+- `CreateEvictionPolicy(...)` exists
+- `MasterService` now consumes `config.eviction_policy_type`
+- `MasterService` constructs `eviction_policy_` using `CreateEvictionPolicy(config.eviction_policy_type)`
+- Startup logs in `master_service.cpp` already log the selected policy once config is populated
+
+What is missing:
+- Passing `--eviction_policy=attention_aware` to `mooncake_master` does not work
+- So the CLI/config parsing layer is probably not wired up yet
+
+Useful evidence from current startup logs:
+- The binary already prints a long startup summary from `master.cpp`, including parsed fields like:
+  - rpc_port
+  - enable_http_metadata_server
+  - http_metadata_server_port
+  - eviction_ratio
+  - eviction_high_watermark_ratio
+  - etc.
+- Example log lines:
+  - `master.cpp:819] Master service started on port 50051, ... eviction_ratio=0.05, eviction_high_watermark_ratio=0.95, ...`
+  - `master.cpp:739] Starting C++ HTTP metadata server on 0.0.0.0:8080`
+- But there is no `eviction_policy=...` field in that startup log
+- This strongly suggests the CLI/config layer in `master.cpp` was never updated to parse and print the new option
+
+What I need you to do:
+1. Find where `mooncake_master` parses command-line flags / argv
+2. Find where `MasterServiceConfig` is constructed/populated
+3. Add support for a new CLI/config flag:
+   - `--eviction_policy=<value>`
+4. Parse the string with `ParseEvictionPolicyType(...)`
+5. Store the result in `MasterServiceConfig::eviction_policy_type`
+6. Make sure invalid values produce a reasonable error
+7. Update startup logging so the chosen eviction policy is visible in the main startup summary
+8. Keep changes minimal and idiomatic for this codebase
+
+Please do this carefully:
+- First identify the exact file(s) responsible for:
+  - CLI flag definitions
+  - config parsing
+  - `MasterServiceConfig` population
+  - startup summary logging
+- Then explain the minimal changes needed
+- Then implement them
 
 Important constraints:
-- Do not move shard traversal out of `MasterService`
-- Do not move lock ownership / metadata ownership out of `MasterService`
-- Do not move replica erasure out of `MasterService`
-- Do not bypass existing checks for:
-  - lease expiration
-  - completed replicas only
-  - refcount / active-use protection
-  - soft-pin handling
-- The new policy abstraction should only operate on a vector/list of already-eligible eviction candidates and return selected victim keys
-- Prefer minimal, incremental changes over a full rewrite
+- Do not rewrite unrelated startup/config code
+- Follow the project’s existing flag parsing style exactly
+- If the project uses gflags, absl flags, CLI11, manual argv parsing, or another approach, preserve that style
+- Keep the runtime `MasterService` policy plumbing intact unless needed
+- If `MasterServiceConfig` does not already contain `eviction_policy_type`, add it in the appropriate place with a sensible default
+- If it already exists, ensure the default is preserved when no flag is passed
 
-Please assume the current code structure is roughly:
-- `PutStart(...)` triggers pressure (`need_eviction_ = true`)
-- `EvictionThreadFunc()` decides when to call `BatchEvict(...)`
-- `BatchEvict(...)` currently contains hard-coded victim selection logic
-- `MasterService` is the right place to keep orchestration
-- a separate file is the right place to hold pluggable victim-selection logic
+Expected outcome:
+After your change, this should work:
 
-What I want from you:
-1. First explain the clean abstraction boundary for this refactor
-2. Propose a minimal interface for a new eviction-policy module
-3. Suggest what files/classes/structs to create
-4. Show `eviction_policy.h`
-5. Show `eviction_policy.cpp`
-6. Implement the following additional policies:
-   A. Attention-Aware Eviction
-The Core Concept: LRU assumes the oldest tokens are the least useful, which fails in long-context LLM tasks where early tokens (like system prompts or key instructions) remain critical.
-The Mechanism: Inspired by Attention-Gate, this policy calculates an "attention score" (or saliency) for each token, representing its actual contribution to the model's output during decoding.
-Mooncake Integration: You will average these token-level attention scores across an entire KV cache block. By combining this average score with general relevancy, you create a priority metric to evict the blocks that the model is mathematically ignoring.
+    mooncake_master \
+      --enable_http_metadata_server=true \
+      --http_metadata_server_host=0.0.0.0 \
+      --http_metadata_server_port=8080 \
+      --eviction_policy=attention_aware
 
-B. Score-Based Eviction (NACL approach)
-The Core Concept: Instead of just looking backward at past attention, this policy tries to predict future utility.
-The Mechanism: It uses "proxy tokens" to test and score how strongly different KV entries interact with representative tokens. This interaction strength acts as an estimated utility score.
-Mooncake Integration: You will track these importance scores at the token level and aggregate them into a block-level priority score within Mooncake's KV management layer. When storage gets tight, blocks with the lowest estimated future utility are evicted.
+and:
+- `MasterServiceConfig::eviction_policy_type` should be set correctly
+- `MasterService` should build the right policy object
+- startup logs should show something like `eviction_policy=attention_aware`
 
-C. Layer-Aware Eviction (CAKE approach)
-The Core Concept: Not all transformer layers are created equal. Some layers process highly concentrated, critical information, while others are less impactful.
-The Mechanism: Using attention density and temporal locality, this policy dynamically budgets cache capacity per layer. High-value layers are allocated more cache space, while low-value layers are subjected to heavy token eviction.
-Mooncake Integration: Applying this to Mooncake means adapting the KV-cache management pipeline to be layer-aware. Specifically for prefill nodes, this acts as a filter: they will only retain and transmit the high-value KV segments from important layers, heavily optimizing network bandwidth and memory usage during transfer.
-
-D. SIEVE Eviction (Ultra-Fast, Low-Overhead Baseline)
-
-7. Show the minimal changes needed inside `MasterService::BatchEvict(...)`
-8. Call out invariants and likely pitfalls
-9. Keep code realistic and directly usable
-
-Design preferences:
-- Simple OOP is fine
-- Avoid fancy templates or overengineering
-- Explicit code is preferred
-- Small interface surface is preferred
-- Candidate struct can include fields like:
-  - key
-  - lease_timeout
-  - size
-  - maybe soft_pinned if useful
-- The policy should probably return something like a set of selected keys
-
-Coding goal:
-I want to be able to swap policies without rewriting `BatchEvict(...)` every time.
-
-Please proceed in this order:
-1. summarize the current architecture and why `MasterService` should stay involved
-2. define the policy boundary
-3. propose the new files and interfaces
-4. implement the 4 additional and keep the original batch eviction policy as it's own function in the new file
-6. show the `BatchEvict(...)` integration changes
-7. list risks / testing checks
+Please show me:
+1. which files you changed
+2. the exact code changes
+3. how to test the new CLI flag
+4. any build/runtime caveats

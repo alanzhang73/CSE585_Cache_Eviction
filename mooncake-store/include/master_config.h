@@ -38,6 +38,7 @@ struct MasterConfig {
     std::string memory_allocator;
     std::string allocation_strategy;
     std::string eviction_policy = "original";
+    EvictionPolicyType eviction_policy_type = EvictionPolicyType::ORIGINAL;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -164,13 +165,7 @@ class MasterServiceSupervisorConfig {
             memory_allocator = BufferAllocatorType::OFFSET;
         }
 
-        try {
-            eviction_policy_type =
-                ParseEvictionPolicyType(config.eviction_policy);
-        } catch (const std::exception& e) {
-            LOG(WARNING) << e.what() << ". Defaulting to 'original'.";
-            eviction_policy_type = EvictionPolicyType::ORIGINAL;
-        }
+        eviction_policy_type = config.eviction_policy_type;
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
@@ -336,16 +331,7 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
-        try {
-            eviction_policy_type =
-                ParseEvictionPolicyType(config.eviction_policy);
-        } catch (const std::exception& e) {
-            LOG(WARNING) << e.what()
-                         << ". Defaulting to 'original'. Valid options are: "
-                            "original, size_aware, attention_aware, "
-                            "score_based, layer_aware, sieve";
-            eviction_policy_type = EvictionPolicyType::ORIGINAL;
-        }
+        eviction_policy_type = config.eviction_policy_type;
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;

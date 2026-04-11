@@ -32,6 +32,8 @@ echo "=== Step 4: Build project ==="
 cmake ..
 make -j
 
+sudo make install
+
 echo "=== Step 5: Setup Python virtual environment ==="
 
 # Go back to project root (assumes build/ is one level deep)
@@ -40,6 +42,7 @@ cd ..
 # Create venv if it doesn't exist
 if [ ! -d ".venv" ]; then
     echo "Creating virtual environment..."
+    sudo apt install python3.12-venv
     python3 -m venv .venv
 fi
 

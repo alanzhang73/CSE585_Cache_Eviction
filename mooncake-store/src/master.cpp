@@ -145,6 +145,18 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+
+namespace {
+
+void ParseAndSetEvictionPolicy(mooncake::MasterConfig& master_config) {
+    master_config.eviction_policy_type =
+        mooncake::ParseEvictionPolicyType(master_config.eviction_policy);
+    master_config.eviction_policy =
+        mooncake::ToString(master_config.eviction_policy_type);
+}
+
+}  // namespace
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -616,9 +628,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     try {
-        (void)mooncake::ParseEvictionPolicyType(master_config.eviction_policy);
+        ParseAndSetEvictionPolicy(master_config);
     } catch (const std::exception& e) {
-        LOG(FATAL) << e.what();
+        LOG(FATAL) << e.what()
+                   << ". Valid options are: original, size_aware, "
+                      "attention_aware, score_based, layer_aware, sieve";
         return 1;
     }
 
@@ -655,7 +669,8 @@ int main(int argc, char* argv[]) {
         << ", global_file_segment_size="
         << master_config.global_file_segment_size
         << ", memory_allocator=" << master_config.memory_allocator
-        << ", eviction_policy=" << master_config.eviction_policy
+        << ", eviction_policy="
+        << mooncake::ToString(master_config.eviction_policy_type)
         << ", enable_http_metadata_server="
         << master_config.enable_http_metadata_server
         << ", http_metadata_server_port="
