@@ -19,20 +19,21 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocation_strategy.h"
-#include "eviction_policy.h"
-#include "master_config.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "replica.h"
-#include "rpc_types.h"
 #include "segment.h"
+#include "types.h"
+#include "master_config.h"
+#include "rpc_types.h"
+#include "replica.h"
 #include "serialize/serializer_backend.h"
 #include "task_manager.h"
-#include "types.h"
 
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
+class EvictionStrategy;
+class EvictionPolicy;
 
 // Forward declarations for test classes
 namespace test {
@@ -438,8 +439,14 @@ class MasterService {
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
 
-    // BatchEvict keeps orchestration inside MasterService. The policy object
-    // only ranks already-eligible eviction candidates.
+    // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
+    // object with smaller lease timeout. It has two passes. The first pass only
+    // evicts objects without soft pin. The second pass prioritizes objects
+    // without soft pin, but also allows to evict soft pinned objects if
+    // allow_evict_soft_pinned_objects_ is true. The first pass tries fulfill
+    // evict ratio target. If the actual evicted ratio is less than
+    // evict_ratio_lowerbound, the second pass will be triggered and try to
+    // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
 
     // Clear invalid handles in all shards
@@ -499,6 +506,7 @@ class MasterService {
         mutable std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
                                                 // set for vip objects
+        mutable bool recently_referenced GUARDED_BY(lock){false};
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -640,6 +648,16 @@ class MasterService {
                     std::max(*soft_pin_timeout,
                              now + std::chrono::milliseconds(soft_ttl));
             }
+        }
+
+        void MarkRecentlyReferenced() const {
+            SpinLocker locker(&lock);
+            recently_referenced = true;
+        }
+
+        bool IsRecentlyReferenced() const {
+            SpinLocker locker(&lock);
+            return recently_referenced;
         }
 
         // Check if the lease has expired
@@ -794,10 +812,9 @@ class MasterService {
     // Eviction related members
     std::atomic<bool> need_eviction_{
         false};  // Set to trigger eviction when not enough space left
+    const EvictionPolicyType eviction_policy_type_;
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const EvictionPolicyType eviction_policy_type_;
-    std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -1029,6 +1046,7 @@ class MasterService {
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    std::unique_ptr<EvictionPolicy> eviction_policy_;
 
     bool enable_snapshot_restore_ = false;
 

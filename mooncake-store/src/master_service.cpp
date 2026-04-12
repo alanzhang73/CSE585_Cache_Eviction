@@ -48,6 +48,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     : default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
+      eviction_policy_type_(config.eviction_policy_type),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       client_live_ttl_sec_(config.client_live_ttl_sec),
@@ -62,8 +63,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(
           CreateAllocationStrategy(config.allocation_strategy_type)),
-      eviction_policy_type_(config.eviction_policy_type),
-      eviction_policy_(CreateEvictionPolicy(config.eviction_policy_type)),
       enable_snapshot_restore_(config.enable_snapshot_restore),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
@@ -72,10 +71,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_retention_count_(config.snapshot_retention_count),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      task_manager_(config.task_manager_config) {
     if (enable_snapshot_ || enable_snapshot_restore_) {
         try {
             auto backend_type =
@@ -94,6 +93,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     if (enable_snapshot_restore_) {
         RestoreState();
     }
+    eviction_policy_ = CreateEvictionPolicy(eviction_policy_type_);
     if (enable_snapshot_ && snapshot_retention_count_ == 0) {
         LOG(ERROR) << "snapshot_retention_count must be greater than 0";
         throw std::invalid_argument("snapshot_retention_count must be > 0");
@@ -665,6 +665,7 @@ auto MasterService::GetReplicaList(const std::string& key)
     // Grant a lease to the object so it will not be removed
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    metadata.MarkRecentlyReferenced();
 
     return GetReplicaListResponse(std::move(replica_list),
                                   default_kv_lease_ttl_);
@@ -2839,8 +2840,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long evicted_count = 0;
     long object_count = 0;
     uint64_t total_freed_size = 0;
+    // Randomly select a starting shard to avoid imbalance eviction between
+    // shards. No need to use expensive random_device here.
+    size_t start_idx = rand() % kNumShards;
 
-    // Candidates for second pass eviction
     std::vector<EvictionCandidate> no_pin_candidates;
     std::vector<EvictionCandidate> soft_pin_candidates;
 
@@ -2858,43 +2861,82 @@ void MasterService::BatchEvict(double evict_ratio_target,
         });
     };
 
-    auto build_candidate = [](const std::string& key,
-                              const ObjectMetadata& metadata,
-                              bool soft_pinned) {
+    auto make_candidate = [](const std::string& key,
+                             const ObjectMetadata& metadata,
+                             bool soft_pinned) -> EvictionCandidate {
         EvictionCandidate candidate;
         candidate.key = key;
+        candidate.lease_timeout = metadata.lease_timeout;
         candidate.size = metadata.size;
         candidate.soft_pinned = soft_pinned;
-        {
-            SpinLocker locker(&metadata.lock);
-            candidate.lease_timeout = metadata.lease_timeout;
-        }
+        candidate.recently_referenced = metadata.IsRecentlyReferenced();
         return candidate;
     };
 
-    auto select_victim_set =
-        [this](const std::vector<EvictionCandidate>& candidates,
-               size_t victim_count) {
-            std::unordered_set<std::string> selected;
-            if (!eviction_policy_ || victim_count == 0 || candidates.empty()) {
-                return selected;
+    auto evict_selected_keys =
+        [&](const std::vector<std::string>& selected_keys,
+            bool allow_soft_pinned) -> long {
+        if (selected_keys.empty()) {
+            return 0;
+        }
+
+        std::unordered_set<std::string> victim_keys(selected_keys.begin(),
+                                                    selected_keys.end());
+        long removed = 0;
+
+        for (size_t i = 0; i < kNumShards && !victim_keys.empty(); ++i) {
+                MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
+            auto it = shard->metadata.begin();
+            while (it != shard->metadata.end() && !victim_keys.empty()) {
+                if (victim_keys.find(it->first) == victim_keys.end()) {
+                    ++it;
+                    continue;
+                }
+
+                const bool soft_pinned = it->second.IsSoftPinned(now);
+                if (!it->second.IsLeaseExpired(now) ||
+                    !can_evict_replicas(it->second) ||
+                    (soft_pinned && !allow_soft_pinned)) {
+                    ++it;
+                    continue;
+                }
+
+                total_freed_size += it->second.size * evict_replicas(it->second);
+                victim_keys.erase(it->first);
+                if (!it->second.IsValid()) {
+                    it = shard->metadata.erase(it);
+                } else {
+                    ++it;
+                }
+                ++removed;
+            }
+        }
+
+        return removed;
+    };
+
+    auto remove_selected_candidates =
+        [](std::vector<EvictionCandidate>& candidates,
+           const std::vector<std::string>& selected_keys) {
+            if (selected_keys.empty()) {
+                return;
             }
 
-            auto victims =
-                eviction_policy_->SelectVictims(candidates, victim_count);
-            selected.reserve(victims.size());
-            for (auto& key : victims) {
-                selected.insert(std::move(key));
-            }
-            return selected;
+            std::unordered_set<std::string> selected(selected_keys.begin(),
+                                                     selected_keys.end());
+            candidates.erase(
+                std::remove_if(candidates.begin(), candidates.end(),
+                               [&](const EvictionCandidate& candidate) {
+                                   return selected.find(candidate.key) !=
+                                          selected.end();
+                               }),
+                candidates.end());
         };
 
-    // Randomly select a starting shard to avoid imbalance eviction between
-    // shards. No need to use expensive random_device here.
-    size_t start_idx = rand() % kNumShards;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    // First pass: evict objects without soft pin and lease expired
+    // Build legal candidates. MasterService still owns shard traversal and
+    // legality checks; the policy only ranks already-eligible candidates.
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
 
@@ -2906,75 +2948,30 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // to compute ideal_evict_num
         object_count += shard->metadata.size();
 
-        // To achieve evicted_count / object_count = evict_ratio_target,
-        // ideally how many object should be evicted in this shard
-        const long ideal_evict_num =
-            std::ceil(object_count * evict_ratio_target) - evicted_count;
-
-        std::vector<EvictionCandidate> first_pass_candidates;
-        for (auto it = shard->metadata.begin(); it != shard->metadata.end();
-             it++) {
+        for (const auto& [key, metadata] : shard->metadata) {
             // Skip objects that are not expired or have incomplete replicas
-            if (!it->second.IsLeaseExpired(now) ||
-                !can_evict_replicas(it->second)) {
+            if (!metadata.IsLeaseExpired(now) || !can_evict_replicas(metadata)) {
                 continue;
             }
-            const bool is_soft_pinned = it->second.IsSoftPinned(now);
-            if (!is_soft_pinned) {
-                if (ideal_evict_num > 0) {
-                    first_pass_candidates.push_back(
-                        build_candidate(it->first, it->second, false));
-                } else {
-                    // No need to evict any object in this shard, put to
-                    // second pass candidates
-                    no_pin_candidates.push_back(
-                        build_candidate(it->first, it->second, false));
-                }
+            const bool soft_pinned = metadata.IsSoftPinned(now);
+            if (!soft_pinned) {
+                no_pin_candidates.push_back(
+                    make_candidate(key, metadata, false));
             } else if (allow_evict_soft_pinned_objects_) {
-                // second pass candidates, only if
-                // allow_evict_soft_pinned_objects_ is true
                 soft_pin_candidates.push_back(
-                    build_candidate(it->first, it->second, true));
+                    make_candidate(key, metadata, true));
             }
         }
+    }
 
-        if (ideal_evict_num > 0 && !first_pass_candidates.empty()) {
-            long evict_num =
-                std::min(ideal_evict_num, (long)first_pass_candidates.size());
-            long shard_evicted_count =
-                0;  // number of objects evicted from this shard
-            auto selected_keys =
-                select_victim_set(first_pass_candidates, evict_num);
-            auto it = shard->metadata.begin();
-            while (it != shard->metadata.end()) {
-                // Skip objects that are not allowed to be evicted in the first
-                // pass
-                if (!it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    !can_evict_replicas(it->second)) {
-                    ++it;
-                    continue;
-                }
-                if (selected_keys.find(it->first) != selected_keys.end()) {
-                    // Evict this object
-                    total_freed_size +=
-                        it->second.size *
-                        evict_replicas(it->second);  // Erase memory replicas
-                    if (it->second.IsValid() == false) {
-                        it = shard->metadata.erase(it);
-                    } else {
-                        ++it;
-                    }
-                    shard_evicted_count++;
-                } else {
-                    // second pass candidates
-                    no_pin_candidates.push_back(
-                        build_candidate(it->first, it->second, false));
-                    ++it;
-                }
-            }
-            evicted_count += shard_evicted_count;
-        }
+    const long first_pass_target =
+        std::min(static_cast<long>(no_pin_candidates.size()),
+                 static_cast<long>(std::ceil(object_count * evict_ratio_target)));
+    if (first_pass_target > 0) {
+        auto first_pass_victims = eviction_policy_->SelectVictims(
+            no_pin_candidates, static_cast<size_t>(first_pass_target));
+        evicted_count += evict_selected_keys(first_pass_victims, false);
+        remove_selected_candidates(no_pin_candidates, first_pass_victims);
     }
 
     // Try releasing discarded replicas before we decide whether to do the
@@ -2985,104 +2982,31 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long target_evict_num = std::ceil(object_count * evict_ratio_lowerbound) -
                             evicted_count - released_discarded_cnt;
     // The actual number of objects we can evict in the second pass
-    target_evict_num =
-        std::min(target_evict_num, (long)no_pin_candidates.size() +
-                                      (long)soft_pin_candidates.size());
+    target_evict_num = std::min(
+        target_evict_num,
+        static_cast<long>(no_pin_candidates.size() + soft_pin_candidates.size()));
 
     // Do second pass eviction only if 1). there are candidates that can be
     // evicted AND 2). The evicted number in the first pass is less than
     // evict_ratio_lowerbound.
     if (target_evict_num > 0) {
-        // If 1). there are enough candidates without soft pin OR 2). soft pin
-        // candidates are empty, then do second pass A. Otherwise, do second
-        // pass B. Note that the second condition is ensured implicitly by the
-        // calculation of target_evict_num.
-        if (target_evict_num <= static_cast<long>(no_pin_candidates.size())) {
-            auto selected_keys =
-                select_victim_set(no_pin_candidates, target_evict_num);
+        const auto no_pin_victims = eviction_policy_->SelectVictims(
+            no_pin_candidates,
+            std::min(static_cast<size_t>(target_evict_num),
+                     no_pin_candidates.size()));
+        const long no_pin_evicted = evict_selected_keys(no_pin_victims, false);
+        evicted_count += no_pin_evicted;
+        target_evict_num -= no_pin_evicted;
 
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                MetadataShardAccessorRW shard(this,
-                                              (start_idx + i) % kNumShards);
-                auto it = shard->metadata.begin();
-                while (it != shard->metadata.end() && target_evict_num > 0) {
-                    if (selected_keys.find(it->first) != selected_keys.end() &&
-                        !it->second.IsSoftPinned(now) &&
-                        it->second.IsLeaseExpired(now) &&
-                        can_evict_replicas(it->second)) {
-                        // Evict this object
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
-                            it = shard->metadata.erase(it);
-                        } else {
-                            ++it;
-                        }
-                        evicted_count++;
-                        target_evict_num--;
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-        } else if (!soft_pin_candidates.empty()) {
-            // Second pass B: Prioritize evicting objects without soft pin, but
-            // also allow soft-pinned objects after no-pin candidates are
-            // exhausted.
-
-            const long soft_pin_evict_num =
-                target_evict_num - static_cast<long>(no_pin_candidates.size());
-            auto selected_soft_pin_keys =
-                select_victim_set(soft_pin_candidates, soft_pin_evict_num);
-
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
-                MetadataShardAccessorRW shard(this,
-                                              (start_idx + i) % kNumShards);
-
-                auto it = shard->metadata.begin();
-                while (it != shard->metadata.end() && target_evict_num > 0) {
-                    // Skip objects that are not expired or have incomplete
-                    // replicas
-                    if (!it->second.IsLeaseExpired(now) ||
-                        !can_evict_replicas(it->second)) {
-                        ++it;
-                        continue;
-                    }
-                    const bool should_evict =
-                        !it->second.IsSoftPinned(now) ||
-                        selected_soft_pin_keys.find(it->first) !=
-                            selected_soft_pin_keys.end();
-                    if (should_evict) {
-                        total_freed_size +=
-                            it->second.size *
-                            evict_replicas(
-                                it->second);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
-                            it = shard->metadata.erase(it);
-                        } else {
-                            ++it;
-                        }
-                        evicted_count++;
-                        target_evict_num--;
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-        } else {
-            // This should not happen.
-            LOG(ERROR) << "Error in second pass eviction: target_evict_num="
-                       << target_evict_num
-                       << ", no_pin_candidates.size()="
-                       << no_pin_candidates.size()
-                       << ", soft_pin_candidates.size()="
-                       << soft_pin_candidates.size()
-                       << ", evicted_count=" << evicted_count
-                       << ", object_count=" << object_count
-                       << ", evict_ratio_target=" << evict_ratio_target
-                       << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound;
+        if (target_evict_num > 0 && !soft_pin_candidates.empty()) {
+            const auto soft_pin_victims = eviction_policy_->SelectVictims(
+                soft_pin_candidates,
+                std::min(static_cast<size_t>(target_evict_num),
+                         soft_pin_candidates.size()));
+            const long soft_pin_evicted =
+                evict_selected_keys(soft_pin_victims, true);
+            evicted_count += soft_pin_evicted;
+            target_evict_num -= soft_pin_evicted;
         }
     }
 

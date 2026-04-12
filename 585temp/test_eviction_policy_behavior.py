@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import os
+import sys
 import time
 from typing import Iterable
 
-from mooncake.store import MooncakeDistributedStore
+
+def load_store_class():
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    local_asio = os.path.join(root, "build", "mooncake-asio", "libasio.so")
+    local_integration = os.path.join(root, "build", "mooncake-integration")
+
+    if os.path.exists(local_asio) and os.path.isdir(local_integration):
+        ctypes.CDLL(local_asio, mode=ctypes.RTLD_GLOBAL)
+        sys.path.insert(0, local_integration)
+        import store
+
+        return store.MooncakeDistributedStore
+
+    from mooncake.store import MooncakeDistributedStore
+
+    return MooncakeDistributedStore
+
+
+MooncakeDistributedStore = load_store_class()
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,16 +71,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def put_blob(store: MooncakeDistributedStore, key: str, size_bytes: int) -> None:
+def put_blob(
+    store: MooncakeDistributedStore, key: str, size_bytes: int, *, must_succeed: bool = True
+) -> bool:
     payload = bytes([65 + (len(key) % 26)]) * size_bytes
     rc = store.put(key, payload)
     if rc != 0:
-        raise RuntimeError(f"put failed for {key} with rc={rc}")
+        if must_succeed:
+            raise RuntimeError(f"put failed for {key} with rc={rc}")
+        return False
+    return True
 
 
 def key_exists(store: MooncakeDistributedStore, key: str) -> bool:
     value = store.get(key)
-    return value is not None
+    return value != b""
 
 
 def report_group(store: MooncakeDistributedStore, title: str, keys: Iterable[str]) -> None:
@@ -112,23 +138,28 @@ def main() -> None:
         time.sleep(args.lease_wait_seconds)
 
         print("Phase 4: apply write pressure to trigger eviction")
+        pressure_successes = 0
+        pressure_failures = 0
         for i in range(args.pressure_count):
-            put_blob(store, f"pressure_{i}", 1024 * 1024)
+            if put_blob(store, f"pressure_{i}", 1024 * 1024, must_succeed=False):
+                pressure_successes += 1
+            else:
+                pressure_failures += 1
 
         print()
         print("Survival report after eviction pressure")
         report_group(store, "Older small keys", early_small_keys)
         report_group(store, "Medium keys", mid_medium_keys)
         report_group(store, "Newer large keys", late_large_keys)
+        print(f"Pressure writes: success={pressure_successes}, failures={pressure_failures}")
 
         print()
         print("How to read this:")
         print("  original tends to evict the oldest expired keys first")
         print("  size_aware tends to evict the largest expired keys first")
         print(
-            "  attention_aware, score_based, layer_aware, and sieve currently "
-            "log that they ran, but may behave like the fallback ordering until "
-            "their candidate signals are populated by MasterService"
+            "  sieve prefers expired objects that have not been recently "
+            "referenced, then falls back to lease timeout ordering"
         )
     finally:
         store.close()

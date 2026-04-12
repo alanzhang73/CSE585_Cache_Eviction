@@ -162,6 +162,30 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         return service->PersistState(snapshot_id);
     }
 
+    static void CallBatchEvict(MasterService* service, double target_ratio,
+                               double lowerbound_ratio) {
+        service->BatchEvict(target_ratio, lowerbound_ratio);
+    }
+
+    static bool IsRecentlyReferenced(MasterService* service,
+                                     const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(service, key);
+        if (!accessor.Exists()) {
+            return false;
+        }
+        return accessor.Get().IsRecentlyReferenced();
+    }
+
+    static void SetLeaseTimeoutForTest(
+        MasterService* service, const std::string& key,
+        std::chrono::system_clock::time_point lease_timeout) {
+        MasterService::MetadataAccessorRW accessor(service, key);
+        ASSERT_TRUE(accessor.Exists());
+        auto& metadata = accessor.Get();
+        SpinLocker locker(&metadata.lock);
+        metadata.lease_timeout = lease_timeout;
+    }
+
     // Generate unique snapshot ID (timestamp format)
     std::string GenerateSnapshotId() const {
         auto now = std::chrono::system_clock::now();

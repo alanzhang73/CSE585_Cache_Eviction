@@ -53,6 +53,7 @@ pip install --upgrade pip
 
 echo "Installing mooncake..."
 pip install mooncake
+pip install mooncake-transfer-engine
 
 echo "=== Done ==="
 echo "Virtual environment is active. To reactivate later, run: source venv/bin/activate"
