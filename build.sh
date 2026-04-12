@@ -31,7 +31,6 @@ fi
 echo "=== Step 4: Build project ==="
 cmake ..
 make -j
-
 sudo make install
 
 echo "=== Step 5: Setup Python virtual environment ==="
