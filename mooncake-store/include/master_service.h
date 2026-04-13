@@ -21,6 +21,7 @@
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
+#include "radix_tree_metadata.h"
 #include "segment.h"
 #include "types.h"
 #include "master_config.h"
@@ -474,10 +475,14 @@ class MasterService {
             const UUID& client_id_,
             const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin)
+            bool enable_soft_pin,
+            std::vector<std::string> radix_path_segments_,
+            std::optional<std::string> radix_parent_key_)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
+              radix_path_segments(std::move(radix_path_segments_)),
+              radix_parent_key(std::move(radix_parent_key_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               replicas_(std::move(reps)) {
@@ -497,6 +502,8 @@ class MasterService {
         const UUID client_id;
         const std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+        const std::vector<std::string> radix_path_segments;
+        const std::optional<std::string> radix_parent_key;
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -793,6 +800,16 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
+    std::vector<std::string> BuildRadixPathForPut(
+        const std::string& key, const ReplicateConfig& config) const;
+    void RegisterRadixObject(const std::string& key,
+                             const std::vector<std::string>& path_segments);
+    void UnregisterRadixObject(const std::string& key);
+    bool IsRadixLeafKey(const std::string& key) const;
+    void RebuildRadixTreeIndex();
+    template <typename Predicate>
+    bool WouldRemainValidAfterRemoving(const ObjectMetadata& metadata,
+                                       Predicate&& pred_fn) const;
 
     /**
      * @brief Helper to discard expired processing keys.
@@ -831,6 +848,7 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    RadixTreeMetadataIndex radix_tree_index_;
 
     std::thread snapshot_thread_;
     std::atomic<bool> snapshot_running_{false};
@@ -894,6 +912,7 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
+            service_->UnregisterRadixObject(key_);
             shard_guard_->metadata.erase(it_);
             it_ = shard_guard_->metadata.end();
         }
@@ -909,7 +928,9 @@ class MasterService {
         }
 
         void Create(const UUID& client_id, uint64_t total_length,
-                    std::vector<Replica> replicas, bool enable_soft_pin) {
+                    std::vector<Replica> replicas, bool enable_soft_pin,
+                    std::vector<std::string> radix_path_segments = {},
+                    std::optional<std::string> radix_parent_key = std::nullopt) {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
@@ -917,8 +938,11 @@ class MasterService {
             auto result = shard_guard_->metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
-                                      std::move(replicas), enable_soft_pin));
+                                      std::move(replicas), enable_soft_pin,
+                                      std::move(radix_path_segments),
+                                      std::move(radix_parent_key)));
             it_ = result.first;
+            service_->RegisterRadixObject(key_, it_->second.radix_path_segments);
         }
 
        private:
@@ -1118,5 +1142,20 @@ class MasterService {
     // Task manager
     ClientTaskManager task_manager_;
 };
+
+template <typename Predicate>
+bool MasterService::WouldRemainValidAfterRemoving(const ObjectMetadata& metadata,
+                                                  Predicate&& pred_fn) const {
+    bool has_remaining_valid_replica = false;
+    metadata.VisitReplicas(
+        [&](const Replica& replica) { return !pred_fn(replica); },
+        [&](const Replica& replica) {
+            if (!replica.is_memory_replica() ||
+                !replica.has_invalid_mem_handle()) {
+                has_remaining_valid_replica = true;
+            }
+        });
+    return metadata.size > 0 && has_remaining_valid_replica;
+}
 
 }  // namespace mooncake

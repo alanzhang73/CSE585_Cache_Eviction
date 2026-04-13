@@ -89,6 +89,8 @@ struct ReplicateConfig {
     std::string preferred_segment{};  // Deprecated: Single preferred segment
                                       // for backward compatibility
     bool prefer_alloc_in_same_node{false};
+    std::optional<std::string> radix_parent_key{};
+    std::vector<std::string> radix_path_segments{};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -105,7 +107,18 @@ struct ReplicateConfig {
                << config.preferred_segment;
         }
         os << ", prefer_alloc_in_same_node: "
-           << config.prefer_alloc_in_same_node << " }";
+           << config.prefer_alloc_in_same_node;
+        if (config.radix_parent_key.has_value()) {
+            os << ", radix_parent_key: " << *config.radix_parent_key;
+        }
+        os << ", radix_path_segments: [";
+        for (size_t i = 0; i < config.radix_path_segments.size(); ++i) {
+            os << config.radix_path_segments[i];
+            if (i + 1 < config.radix_path_segments.size()) {
+                os << ", ";
+            }
+        }
+        os << "] }";
         return os;
     }
 };

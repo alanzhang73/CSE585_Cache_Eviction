@@ -184,6 +184,52 @@ MasterService::~MasterService() {
     }
 }
 
+std::vector<std::string> MasterService::BuildRadixPathForPut(
+    const std::string& key, const ReplicateConfig& config) const {
+    std::vector<std::string> path_segments;
+    if (config.radix_parent_key.has_value()) {
+        MetadataAccessorRO parent_accessor(this, *config.radix_parent_key);
+        if (!parent_accessor.Exists()) {
+            return {};
+        }
+        path_segments = parent_accessor.Get().radix_path_segments;
+    }
+
+    if (!config.radix_path_segments.empty()) {
+        path_segments.insert(path_segments.end(),
+                             config.radix_path_segments.begin(),
+                             config.radix_path_segments.end());
+    }
+
+    if (path_segments.empty()) {
+        path_segments.push_back(key);
+    }
+    return path_segments;
+}
+
+void MasterService::RegisterRadixObject(
+    const std::string& key, const std::vector<std::string>& path_segments) {
+    radix_tree_index_.RegisterObject(key, path_segments);
+}
+
+void MasterService::UnregisterRadixObject(const std::string& key) {
+    radix_tree_index_.UnregisterObject(key);
+}
+
+bool MasterService::IsRadixLeafKey(const std::string& key) const {
+    return radix_tree_index_.IsLeafObject(key);
+}
+
+void MasterService::RebuildRadixTreeIndex() {
+    radix_tree_index_.Clear();
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (const auto& [key, metadata] : shard->metadata) {
+            radix_tree_index_.RegisterObject(key, metadata.radix_path_segments);
+        }
+    }
+}
+
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -282,6 +328,7 @@ void MasterService::ClearInvalidHandles() {
                 shard->processing_keys.erase(it->first);
                 shard->replication_tasks.erase(it->first);
                 shard->offloading_tasks.erase(it->first);
+                UnregisterRadixObject(it->first);
                 it = shard->metadata.erase(it);
             } else {
                 ++it;
@@ -509,6 +556,11 @@ auto MasterService::BatchReplicaClear(
         }
 
         if (clear_all_segments) {
+            if (!IsRadixLeafKey(key)) {
+                LOG(WARNING) << "BatchReplicaClear: key=" << key
+                             << " has radix descendants, skipping";
+                continue;
+            }
             // Check if all replicas are complete. Incomplete replicas could
             // indicate an ongoing Put operation, and clearing during this time
             // could lead to an inconsistent state or interfere with the write.
@@ -566,6 +618,13 @@ auto MasterService::BatchReplicaClear(
                     << "BatchReplicaClear: key=" << key
                     << " has no replica on segment_name=" << segment_name
                     << ", skipping";
+                continue;
+            }
+
+            if (!WouldRemainValidAfterRemoving(metadata, match_replica_on_segment) &&
+                !IsRadixLeafKey(key)) {
+                LOG(WARNING) << "BatchReplicaClear: key=" << key
+                             << " would orphan radix descendants, skipping";
                 continue;
             }
 
@@ -697,6 +756,13 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             << ", slice_length=" << slice_length << ", config=" << config
             << ", action=put_start_begin";
 
+    const auto radix_path_segments = BuildRadixPathForPut(key, config);
+    if (radix_path_segments.empty()) {
+        LOG(ERROR) << "key=" << key
+                   << ", error=invalid_radix_parent_or_path";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
     MetadataShardAccessorRW shard(this, getShardIndex(key));
@@ -718,6 +784,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
             shard->processing_keys.erase(key);
+            UnregisterRadixObject(key);
             shard->metadata.erase(it);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -776,9 +843,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
-                              config.with_soft_pin));
+                              config.with_soft_pin, radix_path_segments,
+                              config.radix_parent_key));
     // Also insert the metadata into processing set for monitoring.
     shard->processing_keys.insert(key);
+    RegisterRadixObject(key, shard->metadata.at(key).radix_path_segments);
 
     return replica_list;
 }
@@ -847,7 +916,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         accessor.Create(
             client_id,
             replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{}, false);
+            std::vector<Replica>{}, false, {key}, std::nullopt);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -916,9 +985,17 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         MasterMetricManager::instance().dec_file_cache_nums();
     }
 
-    metadata.EraseReplicas([replica_type](const Replica& replica) {
+    const auto match_replica_type = [replica_type](const Replica& replica) {
         return replica.type() == replica_type;
-    });
+    };
+    if (!WouldRemainValidAfterRemoving(metadata, match_replica_type) &&
+        !IsRadixLeafKey(key)) {
+        LOG(WARNING) << "key=" << key
+                     << ", error=radix_descendants_prevent_revoke";
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    metadata.EraseReplicas(match_replica_type);
 
     // If the object is completed, remove it from the processing set.
     if (metadata.AllReplicas(&Replica::fn_is_completed) &&
@@ -965,10 +1042,31 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
     auto& metadata = accessor.Get();
 
     if (replica_type == ReplicaType::DISK) {
+        if (!WouldRemainValidAfterRemoving(
+                metadata,
+                [](const Replica& replica) { return replica.is_disk_replica(); }) &&
+            !IsRadixLeafKey(key)) {
+            LOG(WARNING) << "key=" << key
+                         << ", error=radix_descendants_prevent_disk_eviction";
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
         metadata.EraseReplicas(
             [](const Replica& replica) { return replica.is_disk_replica(); });
         MasterMetricManager::instance().dec_file_cache_nums();
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
+        if (!WouldRemainValidAfterRemoving(
+                metadata,
+                [&client_id](const Replica& replica) {
+                    return replica.is_local_disk_replica() &&
+                           replica.get_descriptor()
+                                   .get_local_disk_descriptor()
+                                   .client_id == client_id;
+                }) &&
+            !IsRadixLeafKey(key)) {
+            LOG(WARNING) << "key=" << key
+                         << ", error=radix_descendants_prevent_disk_eviction";
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
         metadata.EraseReplicas([&client_id](const Replica& replica) {
             return replica.is_local_disk_replica() &&
                    replica.get_descriptor()
@@ -1489,9 +1587,17 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
                     ++it;
                     continue;
                 }
+                if (!IsRadixLeafKey(it->first)) {
+                    LOG(WARNING) << "key=" << it->first
+                                 << ", matched by regex, but has radix "
+                                    "descendants. Skipping removal.";
+                    ++it;
+                    continue;
+                }
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                UnregisterRadixObject(it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1530,10 +1636,12 @@ long MasterService::RemoveAll(bool force) {
              */
             if ((force || it->second.IsLeaseExpired(now)) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
-                !shard->replication_tasks.contains(it->first)) {
+                !shard->replication_tasks.contains(it->first) &&
+                IsRadixLeafKey(it->first)) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
+                UnregisterRadixObject(it->first);
                 it = shard->metadata.erase(it);
                 removed_count++;
             } else {
@@ -1803,6 +1911,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (!metadata.IsValid() ||
             metadata.AllReplicas(&Replica::fn_is_completed)) {
             if (!metadata.IsValid()) {
+                UnregisterRadixObject(it->first);
                 shard->metadata.erase(it);
             }
             key_it = shard->processing_keys.erase(key_it);
@@ -1825,6 +1934,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid()) {
                 // All replicas of this object are discarded, just
                 // remove the whole object.
+                UnregisterRadixObject(it->first);
                 shard->metadata.erase(it);
             }
 
@@ -1878,6 +1988,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         // Check whether the object is still valid.
         if (!metadata.IsValid()) {
+            UnregisterRadixObject(task_it->first);
             shard->metadata.erase(metadata_it);
         }
 
@@ -2923,6 +3034,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 total_freed_size += it->second.size * evict_replicas(it->second);
                 remaining_evict_keys.erase(it->first);
                 if (!it->second.IsValid()) {
+                    UnregisterRadixObject(it->first);
                     it = shard->metadata.erase(it);
                 } else {
                     ++it;
@@ -2965,6 +3077,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 total_freed_size += it->second.size * evict_replicas(it->second);
                 victim_keys.erase(it->first);
                 if (!it->second.IsValid()) {
+                    UnregisterRadixObject(it->first);
                     it = shard->metadata.erase(it);
                 } else {
                     ++it;
@@ -3011,6 +3124,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         for (const auto& [key, metadata] : shard->metadata) {
             current_keys.push_back(key);
+            if (!IsRadixLeafKey(key)) {
+                continue;
+            }
             // Skip objects that are not expired or have incomplete replicas
             if (!metadata.IsLeaseExpired(now) || !can_evict_replicas(metadata)) {
                 continue;
@@ -3388,6 +3504,8 @@ MasterService::MetadataSerializer::Deserialize(
         }
     }
 
+    service_->RebuildRadixTreeIndex();
+
     // Deserialize discarded_replicas
     if (discarded_replicas_obj == nullptr) {
         return tl::make_unexpected(SerializationError(
@@ -3419,6 +3537,7 @@ void MasterService::MetadataSerializer::Reset() {
     for (auto& shard : service_->metadata_shards_) {
         shard.metadata.clear();
     }
+    service_->radix_tree_index_.Clear();
     {
         std::lock_guard lock(service_->discarded_replicas_mutex_);
         service_->discarded_replicas_.clear();
@@ -3522,7 +3641,9 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
             std::forward_as_tuple(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
-                metadata_ptr->soft_pin_timeout.has_value()));
+                metadata_ptr->soft_pin_timeout.has_value(),
+                metadata_ptr->radix_path_segments,
+                metadata_ptr->radix_parent_key));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -3537,10 +3658,11 @@ MasterService::MetadataSerializer::SerializeMetadata(
     MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, replicas...]
+    // has_soft_pin_timeout, soft_pin_timeout, has_radix_parent_key,
+    // radix_parent_key, radix_path_count, radix_path..., replicas_count,
+    // replicas...]
 
-    size_t array_size = 7;  // size, lease_timeout, has_soft_pin_timeout,
-                            // soft_pin_timeout, replicas_count
+    size_t array_size = 10 + metadata.radix_path_segments.size();
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -3577,6 +3699,19 @@ MasterService::MetadataSerializer::SerializeMetadata(
         packer.pack(uint64_t(0));  // Placeholder
     }
 
+    if (metadata.radix_parent_key.has_value()) {
+        packer.pack(true);
+        packer.pack(*metadata.radix_parent_key);
+    } else {
+        packer.pack(false);
+        packer.pack(std::string{});
+    }
+
+    packer.pack(static_cast<uint32_t>(metadata.radix_path_segments.size()));
+    for (const auto& segment : metadata.radix_path_segments) {
+        packer.pack(segment);
+    }
+
     // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
 
@@ -3602,9 +3737,10 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             "deserialize ObjectMetadata state is not an array"));
     }
 
-    // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
-    // has_soft_pin_timeout, soft_pin_timeout, replicas_count
-    if (obj.via.array.size < 7) {
+    // Need at least 10 elements: client_id, put_start_time, size,
+    // lease_timeout, has_soft_pin_timeout, soft_pin_timeout,
+    // has_radix_parent_key, radix_parent_key, radix_path_count, replicas_count
+    if (obj.via.array.size < 10) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size is too small"));
@@ -3633,11 +3769,20 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize soft_pin_timeout value
     uint64_t soft_pin_timestamp = array[index++].as<uint64_t>();
 
+    bool has_radix_parent_key = array[index++].as<bool>();
+    std::string radix_parent_key = array[index++].as<std::string>();
+    uint32_t radix_path_count = array[index++].as<uint32_t>();
+    std::vector<std::string> radix_path_segments;
+    radix_path_segments.reserve(radix_path_count);
+    for (uint32_t i = 0; i < radix_path_count; ++i) {
+        radix_path_segments.push_back(array[index++].as<std::string>());
+    }
+
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
     // Check if array size matches replicas_count
-    if (obj.via.array.size != 7 + replicas_count) {
+    if (obj.via.array.size != 10 + radix_path_count + replicas_count) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize ObjectMetadata array size mismatch"));
@@ -3662,7 +3807,9 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin);
+        size, std::move(replicas), enable_soft_pin, std::move(radix_path_segments),
+        has_radix_parent_key ? std::make_optional(radix_parent_key)
+                             : std::nullopt);
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
