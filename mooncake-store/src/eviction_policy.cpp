@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <list>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace mooncake {
 namespace {
@@ -59,6 +62,30 @@ void LogPolicySelection(EvictionPolicyType policy_type,
               << ", victims=[" << SummarizeVictims(victims) << "]";
 }
 
+void LogPolicyActions(EvictionPolicyType policy_type,
+                      const std::vector<EvictionCandidate>& candidates,
+                      size_t requested_victim_count,
+                      const std::vector<EvictionAction>& actions) {
+    std::vector<std::string> victims;
+    victims.reserve(actions.size());
+    size_t clear_reference_count = 0;
+    for (const auto& action : actions) {
+        if (action.action == EvictionActionType::EVICT) {
+            victims.push_back(action.key);
+        } else {
+            ++clear_reference_count;
+        }
+    }
+
+    LOG(INFO) << "action=eviction_policy_actions"
+              << ", policy=" << ToString(policy_type)
+              << ", candidates=" << candidates.size()
+              << ", requested_victim_count=" << requested_victim_count
+              << ", selected_victims=" << victims.size()
+              << ", clear_reference_actions=" << clear_reference_count
+              << ", victims=[" << SummarizeVictims(victims) << "]";
+}
+
 template <typename Compare>
 std::vector<std::string> SelectTopVictims(
     const std::vector<EvictionCandidate>& candidates, size_t victim_count,
@@ -103,7 +130,7 @@ class OriginalEvictionPolicy final : public EvictionPolicy {
 
     std::vector<std::string> SelectVictims(
         const std::vector<EvictionCandidate>& candidates,
-        size_t victim_count) const override {
+        size_t victim_count) override {
         auto victims = SelectTopVictims(
             candidates, victim_count,
             [](const EvictionCandidate& lhs, const EvictionCandidate& rhs) {
@@ -128,7 +155,7 @@ class SizeAwareEvictionPolicy final : public EvictionPolicy {
 
     std::vector<std::string> SelectVictims(
         const std::vector<EvictionCandidate>& candidates,
-        size_t victim_count) const override {
+        size_t victim_count) override {
         auto victims = SelectTopVictims(
             candidates, victim_count,
             [](const EvictionCandidate& lhs, const EvictionCandidate& rhs) {
@@ -153,7 +180,7 @@ class AttentionAwareEvictionPolicy final : public EvictionPolicy {
 
     std::vector<std::string> SelectVictims(
         const std::vector<EvictionCandidate>& candidates,
-        size_t victim_count) const override {
+        size_t victim_count) override {
         auto victims = SelectTopVictims(
             candidates, victim_count,
             [](const EvictionCandidate& lhs, const EvictionCandidate& rhs) {
@@ -182,7 +209,7 @@ class ScoreBasedEvictionPolicy final : public EvictionPolicy {
 
     std::vector<std::string> SelectVictims(
         const std::vector<EvictionCandidate>& candidates,
-        size_t victim_count) const override {
+        size_t victim_count) override {
         auto victims = SelectTopVictims(
             candidates, victim_count,
             [](const EvictionCandidate& lhs, const EvictionCandidate& rhs) {
@@ -212,7 +239,7 @@ class LayerAwareEvictionPolicy final : public EvictionPolicy {
 
     std::vector<std::string> SelectVictims(
         const std::vector<EvictionCandidate>& candidates,
-        size_t victim_count) const override {
+        size_t victim_count) override {
         auto victims = SelectTopVictims(
             candidates, victim_count,
             [](const EvictionCandidate& lhs, const EvictionCandidate& rhs) {
@@ -247,9 +274,48 @@ class SieveEvictionPolicy final : public EvictionPolicy {
         return EvictionPolicyType::SIEVE;
     }
 
+    bool uses_stateful_traversal() const noexcept override { return true; }
+
+    void SynchronizeKeys(
+        const std::vector<std::string>& current_keys) override {
+        std::unordered_set<std::string> current(current_keys.begin(),
+                                               current_keys.end());
+
+        for (auto it = queue_.begin(); it != queue_.end();) {
+            if (!current.contains(*it)) {
+                positions_.erase(*it);
+                if (hand_ == it) {
+                    hand_ = queue_.erase(it);
+                } else {
+                    it = queue_.erase(it);
+                }
+                continue;
+            }
+            ++it;
+        }
+
+        for (const auto& key : current_keys) {
+            if (positions_.contains(key)) {
+                continue;
+            }
+            queue_.push_back(key);
+            auto inserted = std::prev(queue_.end());
+            positions_.emplace(key, inserted);
+            if (hand_ == queue_.end()) {
+                hand_ = queue_.begin();
+            }
+        }
+
+        if (queue_.empty()) {
+            hand_ = queue_.end();
+        } else if (hand_ == queue_.end()) {
+            hand_ = queue_.begin();
+        }
+    }
+
     std::vector<std::string> SelectVictims(
         const std::vector<EvictionCandidate>& candidates,
-        size_t victim_count) const override {
+        size_t victim_count) override {
         auto victims = SelectTopVictims(
             candidates, victim_count,
             [](const EvictionCandidate& lhs, const EvictionCandidate& rhs) {
@@ -267,9 +333,73 @@ class SieveEvictionPolicy final : public EvictionPolicy {
         LogPolicySelection(type(), candidates, victim_count, victims);
         return victims;
     }
+
+    std::vector<EvictionAction> SelectVictimActions(
+        const std::vector<EvictionCandidate>& candidates,
+        size_t victim_count) override {
+        if (victim_count == 0 || candidates.empty() || queue_.empty()) {
+            return {};
+        }
+
+        std::unordered_map<std::string, const EvictionCandidate*> by_key;
+        by_key.reserve(candidates.size());
+        for (const auto& candidate : candidates) {
+            by_key.emplace(candidate.key, &candidate);
+        }
+
+        std::vector<EvictionAction> actions;
+        actions.reserve(victim_count * 2);
+        const size_t max_scan = std::max(queue_.size(), victim_count * 2);
+        size_t scanned = 0;
+        size_t evicted = 0;
+
+        while (!queue_.empty() && scanned < max_scan && evicted < victim_count) {
+            if (hand_ == queue_.end()) {
+                hand_ = queue_.begin();
+            }
+            if (hand_ == queue_.end()) {
+                break;
+            }
+
+            auto current = hand_++;
+            ++scanned;
+
+            auto candidate_it = by_key.find(*current);
+            if (candidate_it == by_key.end()) {
+                continue;
+            }
+
+            const auto& candidate = *candidate_it->second;
+            if (candidate.recently_referenced) {
+                actions.push_back(
+                    {candidate.key, EvictionActionType::CLEAR_REFERENCE_AND_SKIP});
+                continue;
+            }
+
+            actions.push_back({candidate.key, EvictionActionType::EVICT});
+            ++evicted;
+        }
+
+        LogPolicyActions(type(), candidates, victim_count, actions);
+        return actions;
+    }
+
+   private:
+    std::list<std::string> queue_;
+    std::unordered_map<std::string, std::list<std::string>::iterator> positions_;
+    std::list<std::string>::iterator hand_{queue_.end()};
 };
 
 }  // namespace
+
+std::vector<EvictionAction> EvictionPolicy::SelectVictimActions(
+    const std::vector<EvictionCandidate>& candidates, size_t victim_count) {
+    std::vector<EvictionAction> actions;
+    for (auto& key : SelectVictims(candidates, victim_count)) {
+        actions.push_back({std::move(key), EvictionActionType::EVICT});
+    }
+    return actions;
+}
 
 const char* ToString(EvictionPolicyType type) noexcept {
     switch (type) {

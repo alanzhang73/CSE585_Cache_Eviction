@@ -95,6 +95,37 @@ TEST_F(MasterServiceSieveTest,
 }
 
 TEST_F(MasterServiceSieveTest,
+       SieveBatchEvictClearsReferenceThenEvictsOnNextPass) {
+    InitService(EvictionPolicyType::SIEVE);
+    PutObject("a");
+    PutObject("b");
+
+    auto get_result = service_->GetReplicaList("a");
+    ASSERT_TRUE(get_result.has_value());
+    EXPECT_TRUE(IsRecentlyReferenced(service_.get(), "a"));
+
+    const auto expired_time =
+        std::chrono::system_clock::now() - std::chrono::seconds(1);
+    SetLeaseTimeoutForTest(service_.get(), "a", expired_time);
+    SetLeaseTimeoutForTest(service_.get(), "b", expired_time);
+
+    CallBatchEvict(service_.get(), 0.5, 0.5);
+
+    EXPECT_TRUE(ObjectExists(service_.get(), "a"));
+    EXPECT_FALSE(IsRecentlyReferenced(service_.get(), "a"));
+    auto evicted_b = service_->GetReplicaList("b");
+    ASSERT_FALSE(evicted_b.has_value());
+    EXPECT_EQ(evicted_b.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    SetLeaseTimeoutForTest(service_.get(), "a", expired_time);
+    CallBatchEvict(service_.get(), 1.0, 1.0);
+
+    auto evicted_a = service_->GetReplicaList("a");
+    ASSERT_FALSE(evicted_a.has_value());
+    EXPECT_EQ(evicted_a.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(MasterServiceSieveTest,
        OriginalBatchEvictFallsBackToKeyOrderWhenLeaseAndSizeMatch) {
     InitService(EvictionPolicyType::ORIGINAL);
     PutObject("a");

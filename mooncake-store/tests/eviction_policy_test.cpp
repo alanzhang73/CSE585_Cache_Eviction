@@ -35,6 +35,25 @@ TEST(EvictionPolicyTest, SievePrefersUnreferencedCandidates) {
     EXPECT_EQ(victims[0], "unreferenced-new");
 }
 
+TEST(EvictionPolicyTest, SieveClockClearsReferencedBeforeEvicting) {
+    auto policy = CreateEvictionPolicy(EvictionPolicyType::SIEVE);
+    const auto now = std::chrono::system_clock::now();
+
+    policy->SynchronizeKeys({"a", "b"});
+
+    std::vector<EvictionCandidate> candidates = {
+        Candidate("a", true, now - std::chrono::seconds(10)),
+        Candidate("b", false, now - std::chrono::seconds(10)),
+    };
+
+    const auto actions = policy->SelectVictimActions(candidates, 1);
+    ASSERT_EQ(actions.size(), 2);
+    EXPECT_EQ(actions[0].key, "a");
+    EXPECT_EQ(actions[0].action, EvictionActionType::CLEAR_REFERENCE_AND_SKIP);
+    EXPECT_EQ(actions[1].key, "b");
+    EXPECT_EQ(actions[1].action, EvictionActionType::EVICT);
+}
+
 TEST(EvictionPolicyTest, SieveFallsBackToLeaseTimeoutWithinSameReferenceClass) {
     auto policy = CreateEvictionPolicy(EvictionPolicyType::SIEVE);
     const auto now = std::chrono::system_clock::now();
@@ -47,6 +66,31 @@ TEST(EvictionPolicyTest, SieveFallsBackToLeaseTimeoutWithinSameReferenceClass) {
     const auto victims = policy->SelectVictims(candidates, 1);
     ASSERT_EQ(victims.size(), 1);
     EXPECT_EQ(victims[0], "older");
+}
+
+TEST(EvictionPolicyTest, SieveClockEvictsClearedCandidateOnNextPass) {
+    auto policy = CreateEvictionPolicy(EvictionPolicyType::SIEVE);
+    const auto now = std::chrono::system_clock::now();
+
+    policy->SynchronizeKeys({"a", "b"});
+
+    std::vector<EvictionCandidate> first_pass = {
+        Candidate("a", true, now - std::chrono::seconds(10)),
+        Candidate("b", false, now - std::chrono::seconds(10)),
+    };
+
+    const auto first_actions = policy->SelectVictimActions(first_pass, 1);
+    ASSERT_EQ(first_actions.size(), 2);
+    EXPECT_EQ(first_actions[1].key, "b");
+    EXPECT_EQ(first_actions[1].action, EvictionActionType::EVICT);
+
+    std::vector<EvictionCandidate> second_pass = {
+        Candidate("a", false, now - std::chrono::seconds(10)),
+    };
+    const auto second_actions = policy->SelectVictimActions(second_pass, 1);
+    ASSERT_EQ(second_actions.size(), 1);
+    EXPECT_EQ(second_actions[0].key, "a");
+    EXPECT_EQ(second_actions[0].action, EvictionActionType::EVICT);
 }
 
 TEST(EvictionPolicyTest, OriginalIgnoresRecentlyReferencedBit) {

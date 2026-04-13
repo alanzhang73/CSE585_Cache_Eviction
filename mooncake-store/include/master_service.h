@@ -660,6 +660,16 @@ class MasterService {
             return recently_referenced;
         }
 
+        void ClearRecentlyReferenced() const {
+            SpinLocker locker(&lock);
+            recently_referenced = false;
+        }
+
+        std::chrono::system_clock::time_point GetLeaseTimeout() const {
+            SpinLocker locker(&lock);
+            return lease_timeout;
+        }
+
         // Check if the lease has expired
         bool IsLeaseExpired() const {
             SpinLocker locker(&lock);

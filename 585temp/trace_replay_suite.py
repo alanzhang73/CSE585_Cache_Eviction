@@ -49,6 +49,9 @@ class TraceProfile:
     min_hash_frequency: int
     max_prefix_hashes_per_request: int
     max_eligible_hashes: int
+    scan_burst_interval: int
+    scan_burst_keys: int
+    scan_burst_bytes: int
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -72,6 +75,9 @@ PROFILES = {
         min_hash_frequency=2,
         max_prefix_hashes_per_request=48,
         max_eligible_hashes=1200,
+        scan_burst_interval=125,
+        scan_burst_keys=24,
+        scan_burst_bytes=160 * 1024,
     ),
     "conversation_replay": TraceProfile(
         trace_path=os.path.join(ROOT, "FAST25-release", "traces", "conversation_trace.jsonl"),
@@ -90,6 +96,9 @@ PROFILES = {
         min_hash_frequency=2,
         max_prefix_hashes_per_request=48,
         max_eligible_hashes=1200,
+        scan_burst_interval=96,
+        scan_burst_keys=20,
+        scan_burst_bytes=160 * 1024,
     ),
     "trace_phase_shift": TraceProfile(
         trace_path=os.path.join(ROOT, "FAST25-release", "traces", "conversation_trace.jsonl"),
@@ -108,6 +117,9 @@ PROFILES = {
         min_hash_frequency=2,
         max_prefix_hashes_per_request=24,
         max_eligible_hashes=256,
+        scan_burst_interval=0,
+        scan_burst_keys=0,
+        scan_burst_bytes=0,
     ),
 }
 
@@ -342,7 +354,9 @@ def print_summary(
     print(
         "Replay model: "
         f"min_hash_frequency={profile.min_hash_frequency}, "
-        f"max_prefix_hashes_per_request={profile.max_prefix_hashes_per_request}"
+        f"max_prefix_hashes_per_request={profile.max_prefix_hashes_per_request}, "
+        f"scan_burst_interval={profile.scan_burst_interval}, "
+        f"scan_burst_keys={profile.scan_burst_keys}"
     )
     if profile.phase_shift:
         print(
@@ -445,6 +459,7 @@ def main() -> None:
     stats = ReplayStats()
     prefix_payload = b"P" * profile.prefix_bytes
     session_payload = b"S" * profile.session_bytes
+    scan_payload = b"X" * profile.scan_burst_bytes if profile.scan_burst_bytes > 0 else b""
     cold_keys: list[str] = []
     prev_timestamp = int(records[0]["timestamp"])
     unique_inserted: set[int] = set()
@@ -500,6 +515,17 @@ def main() -> None:
                     session_keys.append(key)
             if idx < max(1, min(16, len(records) // 20)):
                 cold_keys.extend(session_keys[:1])
+
+            if (
+                not profile.phase_shift
+                and profile.scan_burst_interval > 0
+                and profile.scan_burst_keys > 0
+                and scan_payload
+                and (idx + 1) % profile.scan_burst_interval == 0
+            ):
+                for scan_idx in range(profile.scan_burst_keys):
+                    scan_key = namespaced_key(args, f"scan/{idx}/burst-{scan_idx}")
+                    put_with_retries(store, scan_key, scan_payload, stats, args)
 
             if profile.phase_shift and idx + 1 == split:
                 old_mid_hits, old_mid_total = verify_prefix_group(

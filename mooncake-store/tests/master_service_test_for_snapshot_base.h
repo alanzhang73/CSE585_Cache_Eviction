@@ -176,6 +176,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         return accessor.Get().IsRecentlyReferenced();
     }
 
+    static bool ObjectExists(MasterService* service, const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(service, key);
+        return accessor.Exists();
+    }
+
     static void SetLeaseTimeoutForTest(
         MasterService* service, const std::string& key,
         std::chrono::system_clock::time_point lease_timeout) {
