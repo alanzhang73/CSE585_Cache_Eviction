@@ -284,10 +284,10 @@ class SieveEvictionPolicy final : public EvictionPolicy {
         for (auto it = queue_.begin(); it != queue_.end();) {
             if (!current.contains(*it)) {
                 positions_.erase(*it);
-                if (hand_ == it) {
-                    hand_ = queue_.erase(it);
-                } else {
-                    it = queue_.erase(it);
+                const bool erased_hand = (hand_ == it);
+                it = queue_.erase(it);
+                if (erased_hand) {
+                    hand_ = it;
                 }
                 continue;
             }

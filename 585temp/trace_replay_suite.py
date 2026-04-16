@@ -269,6 +269,7 @@ def put_with_retries(
     args: argparse.Namespace,
     config=None,
 ) -> bool:
+    invalid_params_rc = -600
     for _ in range(args.put_retries):
         if config is None:
             rc = store.put(key, value)
@@ -278,6 +279,8 @@ def put_with_retries(
             stats.puts += 1
             return True
         stats.put_failures += 1
+        if rc == invalid_params_rc:
+            break
         time.sleep(args.put_retry_sleep_ms / 1000.0)
     time.sleep(args.put_failure_cooldown_ms / 1000.0)
     return False

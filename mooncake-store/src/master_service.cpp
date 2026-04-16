@@ -3006,7 +3006,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 continue;
             }
             auto& metadata = accessor.Get();
-            if (!metadata.IsLeaseExpired(now) || !can_evict_replicas(metadata) ||
+            if (!IsRadixLeafKey(action.key) || !metadata.IsLeaseExpired(now) ||
+                !can_evict_replicas(metadata) ||
                 (metadata.IsSoftPinned(now) && !allow_soft_pinned)) {
                 continue;
             }
@@ -3024,7 +3025,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
 
                 const bool soft_pinned = it->second.IsSoftPinned(now);
-                if (!it->second.IsLeaseExpired(now) ||
+                if (!IsRadixLeafKey(it->first) ||
+                    !it->second.IsLeaseExpired(now) ||
                     !can_evict_replicas(it->second) ||
                     (soft_pinned && !allow_soft_pinned)) {
                     ++it;
@@ -3067,7 +3069,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
 
                 const bool soft_pinned = it->second.IsSoftPinned(now);
-                if (!it->second.IsLeaseExpired(now) ||
+                if (!IsRadixLeafKey(it->first) ||
+                    !it->second.IsLeaseExpired(now) ||
                     !can_evict_replicas(it->second) ||
                     (soft_pinned && !allow_soft_pinned)) {
                     ++it;
@@ -3123,10 +3126,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         object_count += shard->metadata.size();
 
         for (const auto& [key, metadata] : shard->metadata) {
-            current_keys.push_back(key);
             if (!IsRadixLeafKey(key)) {
                 continue;
             }
+            current_keys.push_back(key);
             // Skip objects that are not expired or have incomplete replicas
             if (!metadata.IsLeaseExpired(now) || !can_evict_replicas(metadata)) {
                 continue;
