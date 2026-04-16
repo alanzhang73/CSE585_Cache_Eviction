@@ -237,6 +237,7 @@ def radix_prefix_key(args: argparse.Namespace, chain: list[int]) -> str:
 
 def make_radix_config(parent_key: Optional[str], segment: int):
     cfg = ReplicateConfig()
+    cfg.replica_num = 1
     if parent_key is not None:
         cfg.radix_parent_key = parent_key
     cfg.radix_path_segments = [str(segment)]
