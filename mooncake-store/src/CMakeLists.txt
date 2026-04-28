@@ -4,6 +4,7 @@ add_subdirectory(cachelib_memory_allocator)
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
+    radix_tree_metadata.cpp
     eviction_policy.cpp
     client_service.cpp
     client_metric.cpp

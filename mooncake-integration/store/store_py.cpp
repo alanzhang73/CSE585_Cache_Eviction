@@ -1102,6 +1102,9 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_readwrite("radix_parent_key", &ReplicateConfig::radix_parent_key)
+        .def_readwrite("radix_path_segments",
+                       &ReplicateConfig::radix_path_segments)
         .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;

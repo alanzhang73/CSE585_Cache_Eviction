@@ -4,14 +4,16 @@ import argparse
 from collections import Counter
 import ctypes
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
 import sys
 import time
+from typing import Optional
 
 
-def load_store_class():
+def load_store_module():
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     local_asio = os.path.join(root, "build", "mooncake-asio", "libasio.so")
     local_integration = os.path.join(root, "build", "mooncake-integration")
@@ -21,14 +23,16 @@ def load_store_class():
         sys.path.insert(0, local_integration)
         import store
 
-        return store.MooncakeDistributedStore
+        return store
 
-    from mooncake.store import MooncakeDistributedStore
+    from mooncake import store
 
-    return MooncakeDistributedStore
+    return store
 
 
-MooncakeDistributedStore = load_store_class()
+STORE_MODULE = load_store_module()
+MooncakeDistributedStore = STORE_MODULE.MooncakeDistributedStore
+ReplicateConfig = getattr(STORE_MODULE, "ReplicateConfig", None)
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--put-retries", type=int, default=3)
     parser.add_argument("--put-retry-sleep-ms", type=int, default=200)
     parser.add_argument("--put-failure-cooldown-ms", type=int, default=400)
+    parser.add_argument(
+        "--structure-mode",
+        choices=("legacy", "radix", "auto"),
+        default="auto",
+        help="Use flat prefix keys, explicit radix parent/path metadata, or auto-detect radix support.",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -202,6 +212,49 @@ def namespaced_key(args: argparse.Namespace, suffix: str) -> str:
     return f"trace/{args.run_id}/{suffix}"
 
 
+def effective_structure_mode(args: argparse.Namespace) -> str:
+    if args.structure_mode != "auto":
+        return args.structure_mode
+    if ReplicateConfig is None:
+        return "legacy"
+    cfg = ReplicateConfig()
+    if hasattr(cfg, "radix_parent_key") and hasattr(cfg, "radix_path_segments"):
+        return "radix"
+    return "legacy"
+
+
+def flat_prefix_key(args: argparse.Namespace, hash_id: int) -> str:
+    return namespaced_key(args, f"prefix/{hash_id}")
+
+
+def radix_prefix_key(args: argparse.Namespace, chain: list[int]) -> str:
+    digest = hashlib.blake2b(
+        ",".join(str(hash_id) for hash_id in chain).encode("utf-8"),
+        digest_size=10,
+    ).hexdigest()
+    return namespaced_key(args, f"radix-prefix/{len(chain)}-{digest}")
+
+
+def make_radix_config(parent_key: Optional[str], segment: int):
+    cfg = ReplicateConfig()
+    cfg.replica_num = 1
+    if parent_key is not None:
+        cfg.radix_parent_key = parent_key
+    cfg.radix_path_segments = [str(segment)]
+    return cfg
+
+
+def prefix_key_for_hash(
+    args: argparse.Namespace,
+    hash_id: int,
+    structure_mode: str,
+    last_chain_by_hash: dict[int, tuple[int, ...]],
+) -> str:
+    if structure_mode == "radix" and hash_id in last_chain_by_hash:
+        return radix_prefix_key(args, list(last_chain_by_hash[hash_id]))
+    return flat_prefix_key(args, hash_id)
+
+
 def get_hit(store: MooncakeDistributedStore, key: str, stats: ReplayStats, category: str) -> bool:
     hit = store.get(key) != b""
     stats.record_get(hit, category)
@@ -214,13 +267,20 @@ def put_with_retries(
     value: bytes,
     stats: ReplayStats,
     args: argparse.Namespace,
+    config=None,
 ) -> bool:
+    invalid_params_rc = -600
     for _ in range(args.put_retries):
-        rc = store.put(key, value)
+        if config is None:
+            rc = store.put(key, value)
+        else:
+            rc = store.put(key, value, config)
         if rc == 0:
             stats.puts += 1
             return True
         stats.put_failures += 1
+        if rc == invalid_params_rc:
+            break
         time.sleep(args.put_retry_sleep_ms / 1000.0)
     time.sleep(args.put_failure_cooldown_ms / 1000.0)
     return False
@@ -284,12 +344,16 @@ def verify_prefix_group(
     hash_ids: list[int],
     stats: ReplayStats,
     args: argparse.Namespace,
+    structure_mode: str,
+    last_chain_by_hash: dict[int, tuple[int, ...]],
 ) -> tuple[int, int]:
     hits = 0
     total = 0
     for hash_id in hash_ids:
         total += 1
-        key = namespaced_key(args, f"prefix/{hash_id}")
+        key = prefix_key_for_hash(
+            args, hash_id, structure_mode, last_chain_by_hash
+        )
         if get_hit(store, key, stats, "prefix"):
             hits += 1
     return hits, total
@@ -355,6 +419,7 @@ def print_summary(
         "Replay model: "
         f"min_hash_frequency={profile.min_hash_frequency}, "
         f"max_prefix_hashes_per_request={profile.max_prefix_hashes_per_request}, "
+        f"structure_mode={effective_structure_mode(args)}, "
         f"scan_burst_interval={profile.scan_burst_interval}, "
         f"scan_burst_keys={profile.scan_burst_keys}"
     )
@@ -437,10 +502,12 @@ def main() -> None:
         }
 
     unique_hashes = len(overall_counter)
+    structure_mode = effective_structure_mode(args)
     phase(
         "Phase 0",
         f"profile={args.profile}, records={len(records)}, unique_hashes={unique_hashes}, "
-        f"eligible_hashes={len(eligible_hashes)}, segment={global_segment_size // (1024 * 1024)}MB",
+        f"eligible_hashes={len(eligible_hashes)}, segment={global_segment_size // (1024 * 1024)}MB, "
+        f"structure_mode={structure_mode}",
     )
 
     store = MooncakeDistributedStore()
@@ -462,7 +529,8 @@ def main() -> None:
     scan_payload = b"X" * profile.scan_burst_bytes if profile.scan_burst_bytes > 0 else b""
     cold_keys: list[str] = []
     prev_timestamp = int(records[0]["timestamp"])
-    unique_inserted: set[int] = set()
+    unique_inserted: set[str] = set()
+    last_chain_by_hash: dict[int, tuple[int, ...]] = {}
 
     top_hits = top_total = mid_hits = mid_total = tail_hits = tail_total = 0
     old_hits = old_total = new_hits = new_total = 0
@@ -495,11 +563,34 @@ def main() -> None:
                 if int(hash_id) in eligible_hashes
             ]
             replay_counter.update(hash_ids)
+            chain: list[int] = []
             for hash_id in hash_ids:
-                key = namespaced_key(args, f"prefix/{hash_id}")
-                if not get_hit(store, key, stats, "prefix"):
-                    if put_with_retries(store, key, prefix_payload, stats, args):
-                        unique_inserted.add(hash_id)
+                chain.append(hash_id)
+                if structure_mode == "radix":
+                    key = radix_prefix_key(args, chain)
+                    parent_key = (
+                        radix_prefix_key(args, chain[:-1]) if len(chain) > 1 else None
+                    )
+                    config = make_radix_config(parent_key, hash_id)
+                else:
+                    key = flat_prefix_key(args, hash_id)
+                    config = None
+                hit = get_hit(store, key, stats, "prefix")
+                if hit:
+                    unique_inserted.add(key)
+                    if structure_mode == "radix":
+                        last_chain_by_hash[hash_id] = tuple(chain)
+                    continue
+                if put_with_retries(store, key, prefix_payload, stats, args, config):
+                    unique_inserted.add(key)
+                    if structure_mode == "radix":
+                        last_chain_by_hash[hash_id] = tuple(chain)
+                    continue
+                if structure_mode == "radix":
+                    # A child cannot be created if its parent insert failed, so stop
+                    # extending this request's prefix chain instead of generating
+                    # structurally invalid orphan suffix objects.
+                    break
 
             chunk_count = max(
                 1,
@@ -529,7 +620,7 @@ def main() -> None:
 
             if profile.phase_shift and idx + 1 == split:
                 old_mid_hits, old_mid_total = verify_prefix_group(
-                    store, old_hot, stats, args
+                    store, old_hot, stats, args, structure_mode, last_chain_by_hash
                 )
 
         phase(
@@ -538,17 +629,27 @@ def main() -> None:
         )
 
         if profile.phase_shift:
-            old_hits, old_total = verify_prefix_group(store, old_hot, stats, args)
-            new_hits, new_total = verify_prefix_group(store, new_hot, stats, args)
+            old_hits, old_total = verify_prefix_group(
+                store, old_hot, stats, args, structure_mode, last_chain_by_hash
+            )
+            new_hits, new_total = verify_prefix_group(
+                store, new_hot, stats, args, structure_mode, last_chain_by_hash
+            )
             phase(
                 "Phase 2",
                 f"old_mid={old_mid_hits}/{old_mid_total}, old_end={old_hits}/{old_total}, new_end={new_hits}/{new_total}",
             )
         else:
             top_ids, mid_ids, tail_ids = ranked_hash_ids(replay_counter, profile.verify_count)
-            top_hits, top_total = verify_prefix_group(store, top_ids, stats, args)
-            mid_hits, mid_total = verify_prefix_group(store, mid_ids, stats, args)
-            tail_hits, tail_total = verify_prefix_group(store, tail_ids, stats, args)
+            top_hits, top_total = verify_prefix_group(
+                store, top_ids, stats, args, structure_mode, last_chain_by_hash
+            )
+            mid_hits, mid_total = verify_prefix_group(
+                store, mid_ids, stats, args, structure_mode, last_chain_by_hash
+            )
+            tail_hits, tail_total = verify_prefix_group(
+                store, tail_ids, stats, args, structure_mode, last_chain_by_hash
+            )
             phase(
                 "Phase 2",
                 "top_prefix="

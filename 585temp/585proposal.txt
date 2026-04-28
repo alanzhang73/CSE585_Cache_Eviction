@@ -1,0 +1,68 @@
+﻿CSE 585 Project Proposal: Exploring New Cache Eviction Policies 
+
+
+Evan Wang, Alan Zhang, Frank Fang, Madeleine Hong
+
+
+
+
+1. Introduction
+
+
+Large Language Model (LLM) serving systems increasingly rely on key-value (KV) caches to accelerate autoregressive inference by avoiding redundant computation across tokens and requests. As models grow in size and context length, KV caches have become one of the dominant consumers of memory and a critical determinant of system throughput and latency. Recent work has shown that effective KV cache management is essential for scaling LLM serving under realistic, high-load conditions.
+MOONCAKE (Qin et al., 2025) introduces a KV cache-centric, disaggregated architecture that elevates KV cache from a per-request optimization to a global system resource. By decoupling prefill and decode stages and enabling KV cache reuse across requests, MOONCAKE demonstrates substantial throughput improvements, especially for long-context workloads. This architectural shift highlights that scalable LLM serving is fundamentally a systems problem of managing KV caches under resource constraints.
+In this project, we are interested in a core but underexplored aspect of KV-centric LLM serving: KV cache eviction and retention policies. We plan to build on top of the MOONCAKE framework and implement new eviction policies that have been demonstrated to improve recomputation efficiency while preserving the scalability benefits.
+
+
+2. Motivations
+
+
+MOONCAKE utilizes an LRU (least recently used) eviction policy in their KV cache. LRU has historically been a powerful eviction policy for general caches. However, unlike traditional cache objects, KV entries vary dramatically in size and recomputation cost, and a single long-context request can generate KV data orders of magnitude larger than short prompts. Since LRU has no consideration for these properties of KV entries, large and frequently reused KV entries can be evicted, which leads to significant recomputation overhead, increased latency, and wasted GPU cycles.
+MOONCAKE’s key insight is that storage should be used to save expensive computation. Yet without cost-aware eviction policies, this principle can break down under memory pressure. This motivates the need for eviction and retention policies that explicitly consider KV size, reuse likelihood, and recomputation cost. By designing KV-aware eviction policies aligned with MOONCAKE’s architecture, this project aims to demonstrate that intentionally-designed KV cache management can be essential for sustaining high throughput and low tail latency in scalable LLM serving systems.
+
+
+3. Methods
+
+
+MOONCAKE utilizes a KV cache-centric disaggregated architecture to maximize cache hits, which in turn minimizes key metrics like Time To First Token TTFT) and Time Between Tokens (TBT). At its core, a central “Conductor” manages KV cache stores, eliminating redundant computation and streamlining overall system efficiency. However, the use of this distributed KV cache can only be effective if the eviction policy is efficient in maintaining relevant KV cache stores, as mentioned in our motivations. 
+We propose an extension to the MOONCAKE’s KV cache by replacing the current LRU eviction policy with more dynamic policies and efficient restructuring of the cache:
+
+
+3.1. Attention-Aware Eviction
+
+
+Traditional LRU eviction policies operate under the assumption that recency of tokens directly correlates to relevance. However, in long-context tasks for which MOONCAKE was designed, this assumption can fail. 
+To better align with the model logic, we propose an attention-aware eviction policy that focuses on quantifying a cache’s contributions to the model’s output in decoding. We draw on the concept of the Attention-Gate (Zeng et al., 2024), which uses attention scores (or “saliency scores”) for each token to prune irrelevant tokens before they are even cached. We can build on this idea by computing an average attention score for every cache block within the KV cache. With an attention score in combination with relevancy, we can compute a priority metric that is used as an eviction policy. 
+
+
+3.2. Score-Based Eviction
+
+
+Prior work has proposed alternative KV-cache eviction strategies such as NACL (Chen et al., 2024), which introduces a proxy-token–based importance scoring mechanism. Proxy tokens are used to estimate the relative utility of KV entries by measuring the strength of their interactions with these representative tokens, enabling the system to approximate the future relevance of cached entries. We can apply this eviction policy to the MOONCAKE Store by incorporating importance scores into the KV-cache management layer and aggregating token-level importance signals into block-level eviction priorities. This replaces the current recency-based eviction rule with a score-based eviction process that prioritizes retaining KV blocks with higher estimated utility under storage constraints.
+
+
+3.3. Attention Density and Temporal Locality
+
+
+We also consider the eviction strategy proposed in Cascading and Adaptive KV Cache Eviction (CAKE) (Qin et al., 2025), which introduces a layer-aware cache allocation framework for managing KV memory under constrained budgets. CAKE dynamically partitions the KV cache across transformer layers, allocating cache capacity according to layer-specific importance signals derived from attention density and temporal locality. Layers that exhibit higher concentrations of informative attention patterns receive proportionally larger cache allocations, while less informative layers undergo more aggressive token eviction.
+To apply this approach within MOONCAKE, we plan to integrate CAKE’s layer-aware allocation mechanism into the KV-cache management pipeline. This enables prefill nodes to preferentially retain and transmit higher-value KV segments, reducing unnecessary KV transfers and improving bandwidth efficiency when operating under network or memory constraints.
+
+
+4. Plan of experiments
+
+
+The MOONCAKE paper contains a repository with replay traces of “actual workloads”, as well as an implementation of MOONCAKE using a dummy model mirroring the architecture of LLaMA3-70B. We plan to recreate the same results as seen in the paper to the best of our ability to evaluate against a modified eviction policy. We are interested in measuring differences in decoder latency, cache hit %, prefill GPU computation time, and TTFT and TBT, which were SLOs (service level objectives) that MOONCAKE mentions. 
+
+
+5. References
+
+[1] R. Qin et al., “Mooncake: Trading More Storage for Less Computation -A KVCache-centric Architecture for Serving LLM Chatbot MOONCAKE: Trading More Storage for Less Computation - A KVCache-centric Architecture for Serving LLM Chatbot,” 2025. (accessed Feb. 06, 2025). [Online]. Available: https://www.usenix.org/system/files/fast25-qin.pdf
+
+
+[2] Z. Zeng, B. Lin, T. Hou, H. Zhang, and Z. Deng, “In-context KV-Cache Eviction for LLMs via Attention-Gate,” arXiv.org, 2024. https://arxiv.org/abs/2410.12876 (accessed Feb. 06, 2025).
+
+
+[3] Y. Chen et al., “NACL: A General and Effective KV Cache Eviction Framework for LLMs at Inference Time,” arXiv.org, 2024. https://arxiv.org/abs/2408.03675 (accessed Feb. 06, 2026).
+
+
+[4] Qin, Z., et al. “CAKE: Cascading and Adaptive KV Cache Eviction with Layer Preferences,” Arxiv.org, 2023. https://arxiv.org/html/2503.12491v1 (accessed Feb. 06, 2026).
